@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+congress_data.db
+.streamlit/secrets.toml
+.env
