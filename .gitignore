@@ -4,3 +4,4 @@ __pycache__/
 congress_data.db
 .streamlit/secrets.toml
 .env
+qr_codes/
