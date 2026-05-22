@@ -9,7 +9,7 @@ import qrcode
 from PIL import Image, ImageDraw, ImageFont
 
 
-BASE_URL = "https://NOMEAPP.streamlit.app"
+BASE_URL = "https://eboomer-scale-app-eu8pgbd4za4quqlynwmqyg.streamlit.app"
 
 DATA_PATH = Path("data") / "participants.csv"
 OUTPUT_DIR = Path("qr_codes")
