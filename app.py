@@ -107,15 +107,24 @@ def render_questionnaire() -> None:
     session_id = get_session_id()
     group = get_group()
     participant_id = get_participant_id(group, session_id)
-    questions_df = cached_questions()
+    questions_df = cached_questions().sort_values("order").reset_index(drop=True)
     scoring_df = cached_scoring()
     profiles_df = cached_profiles()
     participants_df = cached_participants()
     display_name = get_display_name(participant_id, group, participants_df)
+    total_questions = len(questions_df)
 
     render_title()
+    st.info(
+        "Segui le indicazioni dei moderatori: Luca e Giammarco vi diranno quando "
+        "procedere al blocco successivo."
+    )
     st.caption(f"Sessione: **{session_id}** · gruppo: **{group}**")
 
+    if "current_question_index" not in st.session_state:
+        st.session_state["current_question_index"] = 0
+    if "answers" not in st.session_state:
+        st.session_state["answers"] = {}
     if "submitted" not in st.session_state:
         st.session_state["submitted"] = False
 
@@ -128,35 +137,82 @@ def render_questionnaire() -> None:
         )
         return
 
-    with st.form("eboomer_questionnaire"):
-        answers = {}
-        for block, block_df in questions_df.groupby("block", sort=False):
-            st.markdown(f"### {SECTION_LABELS.get(block, block)}")
-            for _, row in block_df.sort_values("order").iterrows():
-                question_id = row["question_id"]
-                st.markdown(f"**{question_id}. {row['question_text']}**")
-                labels = [option_label(row, option) for option in OPTION_KEYS]
-                selected_label = st.radio(
-                    "Risposta",
-                    labels,
-                    index=None,
-                    key=f"answer_{question_id}",
-                    label_visibility="collapsed",
-                )
-                if selected_label:
-                    answers[question_id] = selected_label.split(".", 1)[0]
-                if row.get("scientific_note"):
-                    st.caption(row["scientific_note"])
-                st.markdown("")
-
-        submitted = st.form_submit_button("Invia risposte", type="primary", use_container_width=True)
-
-    if not submitted:
+    if total_questions == 0:
+        st.error("Nessuna domanda trovata in data/questions.csv.")
         return
 
+    current_index = min(st.session_state["current_question_index"], total_questions - 1)
+    st.session_state["current_question_index"] = current_index
+    row = questions_df.iloc[current_index]
+    question_id = row["question_id"]
+    current_answer = st.session_state["answers"].get(question_id)
+    labels = [option_label(row, option) for option in OPTION_KEYS]
+    default_index = OPTION_KEYS.index(current_answer) if current_answer in OPTION_KEYS else None
+
+    st.markdown(f"### {SECTION_LABELS.get(row['block'], row['block'])}")
+    st.progress((current_index + 1) / total_questions)
+    st.markdown(f"**Domanda {current_index + 1} di {total_questions}**")
+    st.markdown(f"### {row['question_text']}")
+
+    selected_label = st.radio(
+        "Risposta",
+        labels,
+        index=default_index,
+        key=f"answer_{question_id}",
+        label_visibility="collapsed",
+    )
+    selected_answer = selected_label.split(".", 1)[0] if selected_label else None
+
+    if row.get("scientific_note"):
+        st.caption(row["scientific_note"])
+
+    col_back, col_next = st.columns([1, 2])
+    with col_back:
+        if current_index > 0 and st.button("Indietro", use_container_width=True):
+            if selected_answer:
+                st.session_state["answers"][question_id] = selected_answer
+            st.session_state["current_question_index"] = current_index - 1
+            st.rerun()
+
+    with col_next:
+        is_last_question = current_index == total_questions - 1
+        button_label = "Calcola il mio fenotipo" if is_last_question else "Avanti"
+        if st.button(button_label, type="primary", use_container_width=True):
+            if not selected_answer:
+                st.warning("Seleziona una risposta prima di continuare")
+                return
+            st.session_state["answers"][question_id] = selected_answer
+
+            if not is_last_question:
+                st.session_state["current_question_index"] = current_index + 1
+                st.rerun()
+                return
+
+            finalize_questionnaire(
+                session_id,
+                group,
+                participant_id,
+                display_name,
+                questions_df,
+                scoring_df,
+                profiles_df,
+            )
+            st.rerun()
+
+
+def finalize_questionnaire(
+    session_id: str,
+    group: str,
+    participant_id: str,
+    display_name: str,
+    questions_df: pd.DataFrame,
+    scoring_df: pd.DataFrame,
+    profiles_df: pd.DataFrame,
+) -> None:
+    answers = st.session_state["answers"]
     missing = [qid for qid in questions_df["question_id"] if qid not in answers]
     if missing:
-        st.warning("Completa tutte le domande prima di inviare.")
+        st.warning("Seleziona una risposta prima di continuare")
         return
 
     scores = calculate_scores(answers, scoring_df)
@@ -178,7 +234,6 @@ def render_questionnaire() -> None:
     st.session_state["submitted"] = True
     st.session_state["last_scores"] = scores
     st.session_state["last_profile"] = profile
-    st.rerun()
 
 
 def render_final_profile(profile: dict, scores: dict, group: str, display_name: str) -> None:
