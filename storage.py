@@ -1,4 +1,4 @@
-"""Persistenza SQLite locale per le risposte E-Boomer Scale."""
+"""Persistenza risposte E-Boomer Scale con Google Sheets e fallback SQLite."""
 
 from __future__ import annotations
 
@@ -6,14 +6,17 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+import gspread
 import pandas as pd
+import streamlit as st
+from google.oauth2.service_account import Credentials
 
 from eboomer_core import AXIS_KEYS, PROFILE_LABELS
 
 
 DB_PATH = Path(__file__).parent / "congress_data.db"
 QUESTION_KEYS = [f"Q{i}" for i in range(1, 15)]
-RESPONSE_COLUMNS = [
+EXPECTED_COLUMNS = [
     "timestamp",
     "session_id",
     "group",
@@ -23,6 +26,11 @@ RESPONSE_COLUMNS = [
     *AXIS_KEYS,
     "profile_id",
     "profile_name",
+]
+RESPONSE_COLUMNS = EXPECTED_COLUMNS
+GSHEET_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
 
 
@@ -63,6 +71,39 @@ def init_db() -> None:
         conn.commit()
 
 
+def is_gsheet_configured() -> bool:
+    """Ritorna True se Streamlit secrets contiene la config Google Sheets."""
+    try:
+        return "google_sheets" in st.secrets and "gcp_service_account" in st.secrets
+    except Exception:
+        return False
+
+
+def get_gsheet_client():
+    service_account_info = dict(st.secrets["gcp_service_account"])
+    credentials = Credentials.from_service_account_info(
+        service_account_info,
+        scopes=GSHEET_SCOPES,
+    )
+    return gspread.authorize(credentials)
+
+
+def get_worksheet():
+    sheets_config = st.secrets["google_sheets"]
+    spreadsheet_name = sheets_config["spreadsheet_name"]
+    worksheet_name = sheets_config["worksheet_name"]
+    client = get_gsheet_client()
+    spreadsheet = client.open(spreadsheet_name)
+    return spreadsheet.worksheet(worksheet_name)
+
+
+def ensure_header(ws) -> None:
+    values = ws.get_all_values()
+    header = values[0] if values else []
+    if not header or any(column not in header for column in EXPECTED_COLUMNS):
+        ws.update("A1", [EXPECTED_COLUMNS])
+
+
 def _clean_response(response_dict: dict) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     profile_id = str(response_dict.get("profile_id", "") or "")
@@ -80,16 +121,25 @@ def _clean_response(response_dict: dict) -> dict:
 
     for question_id in QUESTION_KEYS:
         value = response_dict.get(question_id)
-        row[question_id] = str(value).upper().strip() if value else None
+        row[question_id] = str(value).upper().strip() if value else ""
 
     for axis in AXIS_KEYS:
-        row[axis] = int(response_dict.get(axis, 0) or 0)
+        numeric_value = pd.to_numeric(response_dict.get(axis, 0), errors="coerce")
+        row[axis] = 0 if pd.isna(numeric_value) else numeric_value
 
     return row
 
 
-def save_response(response_dict: dict) -> None:
-    """Inserisce una risposta completa nella tabella responses."""
+def _normalize_numeric_axes(df: pd.DataFrame) -> pd.DataFrame:
+    normalized = df.copy()
+    for axis in AXIS_KEYS:
+        if axis not in normalized.columns:
+            normalized[axis] = 0
+        normalized[axis] = pd.to_numeric(normalized[axis], errors="coerce").fillna(0)
+    return normalized
+
+
+def _sqlite_save_response(response_dict: dict) -> None:
     init_db()
     row = _clean_response(response_dict)
     columns = RESPONSE_COLUMNS
@@ -107,11 +157,26 @@ def save_response(response_dict: dict) -> None:
         conn.commit()
 
 
-def get_responses_df() -> pd.DataFrame:
-    """Restituisce tutte le risposte salvate come pandas DataFrame."""
+def save_response(response_dict: dict) -> None:
+    """Salva una risposta su Google Sheets, con fallback SQLite."""
+    if is_gsheet_configured():
+        try:
+            ws = get_worksheet()
+            ensure_header(ws)
+            row = _clean_response(response_dict)
+            values = [row.get(column, "") for column in EXPECTED_COLUMNS]
+            ws.append_row(values, value_input_option="USER_ENTERED")
+            return
+        except Exception:
+            pass
+
+    _sqlite_save_response(response_dict)
+
+
+def _sqlite_get_responses_df() -> pd.DataFrame:
     init_db()
     with _connect() as conn:
-        return pd.read_sql_query(
+        df = pd.read_sql_query(
             """
             SELECT
                 timestamp,
@@ -128,15 +193,54 @@ def get_responses_df() -> pd.DataFrame:
             """,
             conn,
         )
+    return _normalize_numeric_axes(df)
 
 
-def reset_responses() -> int:
-    """Cancella tutte le risposte e ritorna il numero di righe eliminate."""
+def get_responses_df() -> pd.DataFrame:
+    """Restituisce le risposte come DataFrame, usando Google Sheets se possibile."""
+    if is_gsheet_configured():
+        try:
+            ws = get_worksheet()
+            ensure_header(ws)
+            records = ws.get_all_records()
+            if not records:
+                return _normalize_numeric_axes(pd.DataFrame(columns=EXPECTED_COLUMNS))
+            df = pd.DataFrame(records)
+            for column in EXPECTED_COLUMNS:
+                if column not in df.columns:
+                    df[column] = ""
+            df = df[EXPECTED_COLUMNS]
+            return _normalize_numeric_axes(df)
+        except Exception:
+            pass
+
+    return _sqlite_get_responses_df()
+
+
+def _sqlite_reset_responses() -> int:
     init_db()
     with _connect() as conn:
         cur = conn.execute("DELETE FROM responses")
         conn.commit()
         return cur.rowcount
+
+
+def reset_responses() -> int:
+    """Cancella tutte le risposte, mantenendo header Sheets se configurato."""
+    if is_gsheet_configured():
+        try:
+            ws = get_worksheet()
+            ensure_header(ws)
+            values = ws.get_all_values()
+            row_count = len(values)
+            if row_count > 1:
+                ws.delete_rows(2, row_count)
+            ensure_header(ws)
+            return max(row_count - 1, 0)
+        except Exception:
+            pass
+
+    return _sqlite_reset_responses()
 
 
 def save_submission(
