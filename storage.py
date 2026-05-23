@@ -104,6 +104,14 @@ def ensure_header(ws) -> None:
         ws.update("A1", [EXPECTED_COLUMNS])
 
 
+def column_letter(column_number: int) -> str:
+    letters = ""
+    while column_number:
+        column_number, remainder = divmod(column_number - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
 def _clean_response(response_dict: dict) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     profile_id = str(response_dict.get("profile_id", "") or "")
@@ -165,6 +173,22 @@ def save_response(response_dict: dict) -> None:
             ensure_header(ws)
             row = _clean_response(response_dict)
             values = [row.get(column, "") for column in EXPECTED_COLUMNS]
+            if row["group"] == "faculty" and row["participant_id"]:
+                participant_ids = ws.col_values(EXPECTED_COLUMNS.index("participant_id") + 1)
+                try:
+                    existing_row = participant_ids.index(row["participant_id"]) + 1
+                except ValueError:
+                    existing_row = None
+
+                if existing_row and existing_row > 1:
+                    last_column = column_letter(len(EXPECTED_COLUMNS))
+                    ws.update(
+                        f"A{existing_row}:{last_column}{existing_row}",
+                        [values],
+                        value_input_option="USER_ENTERED",
+                    )
+                    return
+
             ws.append_row(values, value_input_option="USER_ENTERED")
             return
         except Exception:
